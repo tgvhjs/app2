@@ -1,5 +1,5 @@
 # ================================================
-# app.py — 월별 매출 대시보드 (개선 통합판)
+# app.py — 월별 매출 대시보드 (개선 통합판, 슬라이더 타입 오류 픽스)
 # ================================================
 # 배포 체크리스트
 # - requirements.txt 권장:
@@ -8,7 +8,7 @@
 #   numpy>=1.26
 #   plotly>=5.22
 #   scipy>=1.11    # (선택) 상관 p-value 계산 시 필요. 미설치 시 p-value는 생략됩니다.
-#   kaleido>=0.2.1 # (선택) 차트 PNG 저장 기능을 추가할 때만 필요
+#   kaleido>=0.2.1 # (선택) 차트 PNG 저장 기능 추가 시 필요
 # - 기본 CSV 파일을 앱과 같은 폴더에 배치: "파트5_월별_매출.csv"
 # - 공개 저장소라면 실제 데이터 대신 더미 CSV 사용 권장
 
@@ -19,9 +19,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from typing import Tuple, Optional, Dict
 
-# ─────────────────────────────────────────────────────────────
-# 전역 설정
-# ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="월별 매출 대시보드", layout="wide")
 
 # 🎨 팔레트 (요청 반영, 글자색 유지)
@@ -125,18 +122,20 @@ def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
         mapping[c] = norm
     return df.rename(columns=mapping)
 
-def validate_schema(df: pd.DataFrame) -> Tuple[bool, str]:
-    """필수 컬럼 존재/타입 변환/결측률 경고 메시지 반환."""
+def validate_schema(df: pd.DataFrame):
+    """필수 컬럼 존재/결측률 경고 메시지 표시."""
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
-        return False, f"다음 컬럼이 없습니다: {missing}\n헤더를 확인하거나 normalize_headers 규칙을 점검하세요."
+        st.error(f"다음 컬럼이 없습니다: {missing}\n헤더를 확인하거나 업로드 파일을 점검하세요.")
+        st.stop()
     # 결측률 요약
-    msg_lines = []
+    lines = []
     for c in REQUIRED_COLS:
         na_ratio = df[c].isna().mean()
         if na_ratio > 0:
-            msg_lines.append(f"- '{c}' 결측률: {na_ratio*100:.1f}% (총 {df[c].isna().sum()}건)")
-    return True, "\n".join(msg_lines)
+            lines.append(f"- '{c}' 결측률: {na_ratio*100:.1f}% (총 {df[c].isna().sum()}건)")
+    if lines:
+        st.warning("데이터 품질 경고:\n" + "\n".join(lines))
 
 def detect_outliers(series: pd.Series, z: float = 3.0) -> pd.Series:
     """평균±z*표준편차 기준 이상치 bool mask."""
@@ -153,7 +152,6 @@ def detect_outliers(series: pd.Series, z: float = 3.0) -> pd.Series:
 
 def compute_correlations(x: pd.Series, y: pd.Series) -> Dict[str, Optional[float]]:
     """피어슨/스피어만 상관 및 p-value (scipy 있으면 p-value 계산)."""
-    # 동시 유효값
     dfc = pd.DataFrame({'x': x, 'y': y}).dropna()
     if len(dfc) < 3:
         return {"pearson_r": None, "pearson_p": None, "spearman_r": None, "spearman_p": None}
@@ -162,15 +160,13 @@ def compute_correlations(x: pd.Series, y: pd.Series) -> Dict[str, Optional[float
         pr = stats.pearsonr(dfc['x'], dfc['y'])
         sr = stats.spearmanr(dfc['x'], dfc['y'])
         return {
-            "pearson_r": float(pr.statistic if hasattr(pr, "statistic") else pr[0]),
-            "pearson_p": float(pr.pvalue if hasattr(pr, "pvalue") else pr[1]),
-            "spearman_r": float(sr.statistic if hasattr(sr, "statistic") else sr.correlation),
+            "pearson_r": float(getattr(pr, "statistic", pr[0])),
+            "pearson_p": float(getattr(pr, "pvalue", pr[1])),
+            "spearman_r": float(getattr(sr, "statistic", sr.correlation)),
             "spearman_p": float(sr.pvalue),
         }
     except Exception:
-        # scipy 미설치 등: r만 numpy/순위로 계산하고 p는 None
         pr = np.corrcoef(dfc['x'], dfc['y'])[0,1]
-        # Spearman r (수동 순위)
         rx = dfc['x'].rank(method='average')
         ry = dfc['y'].rank(method='average')
         sr = np.corrcoef(rx, ry)[0,1]
@@ -196,13 +192,7 @@ def load_sample_csv(rows: int = 12) -> bytes:
 
 def preprocess(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = normalize_headers(df_raw.copy())
-
-    ok, msg = validate_schema(df)
-    if not ok:
-        st.error(msg)
-        st.stop()
-    if msg:
-        st.warning("데이터 품질 경고:\n" + msg)
+    validate_schema(df)
 
     # 수치형 전처리
     for c in ["매출액", "전년동월"]:
@@ -235,7 +225,12 @@ def preprocess(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def apply_filters(df: pd.DataFrame, date_range: Tuple[pd.Timestamp, pd.Timestamp], cat_col: Optional[str], cat_values: Optional[list]) -> pd.DataFrame:
-    msk = (df["월_dt"] >= date_range[0]) & (df["월_dt"] <= date_range[1])
+    # pandas.Timestamp로 통일해서 비교 (Slider는 datetime 반환)
+    msk = (
+        df["월_dt"] >= pd.Timestamp(date_range[0])
+    ) & (
+        df["월_dt"] <= pd.Timestamp(date_range[1])
+    )
     dff = df.loc[msk].copy()
     if cat_col and cat_values:
         dff = dff[dff[cat_col].isin(cat_values)].copy()
@@ -263,10 +258,8 @@ def build_kpis(df: pd.DataFrame, target: Optional[float]):
     cur_month = df.loc[last_idx, "월"]
     cur_sales = df.loc[last_idx, "매출액"]
     prev_sales = df.loc[last_idx-1, "매출액"] if len(df) >= 2 else np.nan
-    # 전년동월은 같은 행의 '전년동월' 사용
     yoy_base = df.loc[last_idx, "전년동월"]
 
-    # KPI 계산
     ytd_sales = df["누적매출"].iloc[-1]
     ytd_prev = df["전년동월"].sum(skipna=True)
     yoy_ytd = ((ytd_sales - ytd_prev) / ytd_prev * 100) if ytd_prev else np.nan
@@ -275,15 +268,11 @@ def build_kpis(df: pd.DataFrame, target: Optional[float]):
     delta_mom_pct = (cur_sales / prev_sales - 1) * 100 if pd.notna(prev_sales) and prev_sales != 0 else np.nan
     delta_yoy_pct = ((cur_sales - yoy_base) / yoy_base * 100) if pd.notna(yoy_base) and yoy_base != 0 else np.nan
 
-    # 연말 예상치(선형)
     forecast = linear_year_end_forecast(ytd_sales, df.shape[0])
     achieve_now = (ytd_sales / target * 100) if target else np.nan
     achieve_forecast = (forecast / target * 100) if (target and forecast) else np.nan
 
-    # 반응형 KPI 레이아웃 (넓은 화면 4열, 아니면 2x2)
-    cols = st.columns(4) if st._get_option("client.showSidebarNavigation") is not None else st.columns(4)
-    c1, c2, c3, c4 = cols
-
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric(
             label=f"이번 달 매출 ({cur_month})",
@@ -314,7 +303,6 @@ def build_kpis(df: pd.DataFrame, target: Optional[float]):
 # ─────────────────────────────────────────────────────────────
 def build_fig_trend(df: pd.DataFrame, show_outliers: bool, show_target_line: bool, target: Optional[float]) -> go.Figure:
     fig = go.Figure()
-    # 호버 텍스트
     hover = [
         f"{m}<br>매출액: {format_krw_short(a)}<br>3M MA: {format_krw_short(ma)}<br>MoM: {format_krw_short(mom)}"
         for m, a, ma, mom in zip(df["월"], df["매출액"], df["MA3"], df["MoM"])
@@ -335,11 +323,10 @@ def build_fig_trend(df: pd.DataFrame, show_outliers: bool, show_target_line: boo
             hovertemplate="%{x}<br>3M MA: %{y:,}<extra></extra>"
         )
     )
-
     if show_target_line and target and target > 0:
-        # 월별 목표선: 단순히 월평균 목표(=연간 목표/12) 참고선
         monthly_target = target / 12.0
-        fig.add_hline(y=monthly_target, line=dict(color=COLOR_5, width=2, dash="dot"), annotation_text="월평균 목표", annotation_position="top left")
+        fig.add_hline(y=monthly_target, line=dict(color=COLOR_5, width=2, dash="dot"),
+                      annotation_text="월평균 목표", annotation_position="top left")
 
     if show_outliers:
         mask = detect_outliers(df["매출액"])
@@ -354,7 +341,6 @@ def build_fig_trend(df: pd.DataFrame, show_outliers: bool, show_target_line: boo
                     hovertemplate="%{x}<br><b>이상치</b> 매출액: %{y:,}<extra></extra>"
                 )
             )
-
     fig.update_layout(**COMMON_LAYOUT, yaxis=dict(title="원", gridcolor=COLOR_GRID))
     return fig
 
@@ -381,19 +367,17 @@ def build_fig_yoy(df: pd.DataFrame) -> Tuple[go.Figure, str]:
         ),
         secondary_y=True
     )
-
     fig.update_yaxes(title_text="매출액(원)", secondary_y=False, gridcolor=COLOR_GRID)
     fig.update_yaxes(title_text="전년동월(원)", secondary_y=True, showgrid=False)
     fig.update_layout(**COMMON_LAYOUT)
 
-    # 상관 통계
     stats = compute_correlations(df["매출액"], df["전년동월"])
-    def f(x): return "N/A" if x is None else f"{x:.3f}"
+    f3 = lambda v: "N/A" if v is None else f"{v:.3f}"
     caption = (
-        f"피어슨 r={f(stats['pearson_r'])}"
-        + (f", p={f(stats['pearson_p'])}" if stats["pearson_p"] is not None else ", p=N/A")
-        + f" | 스피어만 r={f(stats['spearman_r'])}"
-        + (f", p={f(stats['spearman_p'])}" if stats["spearman_p"] is not None else ", p=N/A")
+        f"피어슨 r={f3(stats['pearson_r'])}"
+        + (f", p={f3(stats['pearson_p'])}" if stats["pearson_p"] is not None else ", p=N/A")
+        + f" | 스피어만 r={f3(stats['spearman_r'])}"
+        + (f", p={f3(stats['spearman_p'])}" if stats["spearman_p"] is not None else ", p=N/A")
     )
     return fig, caption
 
@@ -470,14 +454,13 @@ st.sidebar.title("설정")
 # 데이터 섹션
 st.sidebar.subheader("데이터")
 uploaded = st.sidebar.file_uploader("CSV 업로드 (월, 매출액, 전년동월, 증감률)", type=["csv"])
-if st.sidebar.button("샘플 CSV 다운로드"):
-    st.download_button(
-        label="샘플 CSV 저장 (UTF-8-SIG)",
-        data=load_sample_csv(),
-        file_name="sample_월별매출.csv",
-        mime="text/csv",
-        help="현재 스키마(월, 매출액, 전년동월, 증감률)로 12개월 더미 데이터"
-    )
+st.sidebar.download_button(
+    label="샘플 CSV 저장 (UTF-8-SIG)",
+    data=load_sample_csv(),
+    file_name="sample_월별매출.csv",
+    mime="text/csv",
+    help="현재 스키마(월, 매출액, 전년동월, 증감률)로 12개월 더미 데이터"
+)
 
 st.sidebar.markdown("---")
 
@@ -528,9 +511,16 @@ if cat_col:
     if unique_vals:
         cat_values = st.sidebar.multiselect(f"{cat_col} 필터", options=unique_vals, default=unique_vals)
 
-# 기간 필터
-min_dt, max_dt = df["월_dt"].min(), df["월_dt"].max()
-date_range = st.sidebar.slider("분석 기간", min_value=min_dt, max_value=max_dt, value=(min_dt, max_dt), format="YYYY-MM")
+# 기간 필터 (슬라이더 타입 오류 픽스: datetime으로 받고, 비교는 pd.Timestamp로)
+min_dt_pd, max_dt_pd = df["월_dt"].min(), df["월_dt"].max()
+min_dt = pd.to_datetime(min_dt_pd).to_pydatetime()
+max_dt = pd.to_datetime(max_dt_pd).to_pydatetime()
+date_range = st.sidebar.slider(
+    "분석 기간",
+    min_value=min_dt,
+    max_value=max_dt,
+    value=(min_dt, max_dt),
+)
 
 # 필터 적용
 dff = apply_filters(df, date_range, cat_col, cat_values)
